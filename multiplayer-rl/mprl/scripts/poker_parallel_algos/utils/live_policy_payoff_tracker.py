@@ -123,13 +123,11 @@ class LivePolicyPayoffTracker(object):
         if base_payoff_table is None:
             base_payoff_table = PayoffTable()
         base_payoff_table: PayoffTable = base_payoff_table
-        active_policy_numbers, finished_policy_numbers, total_policy_numbers = self.get_active_and_finished_policy_numbers()
+        active_policy_numbers, finished_policy_numbers, total_policy_numbers = self._get_active_and_finished_policy_numbers()
         assert len(active_policy_numbers) + len(finished_policy_numbers) == total_policy_numbers
         are_all_lower_policies_finished = len(active_policy_numbers) == 0
 
-        print(colored(f"Policy {self._claimed_policy_num}: There are {total_policy_numbers} policies below this learner. "
-                      f"(Active policies below {self._claimed_policy_num} are {active_policy_numbers}. "
-                      f"Frozen policies below {self._claimed_policy_num} are {finished_policy_numbers}).", "white"))
+        print(colored(f"Policy {self._claimed_policy_num}: Latest live stats for policies below this learner: {len(finished_policy_numbers)} policies finished, {len(active_policy_numbers)} active.", "cyan"))
 
         if total_policy_numbers == 0:
             return None, are_all_lower_policies_finished
@@ -195,9 +193,103 @@ class LivePolicyPayoffTracker(object):
         assert base_payoff_table.size() == total_policy_numbers
         return base_payoff_table.to_dill(), are_all_lower_policies_finished
 
+
+    ####################################################################################################################
+    @ray.method(num_return_vals=1)
+    def my_get_live_payoff_table_dill_pickled(self, new_weight_key=None, first_wait_for_n_seconds=None):
+        if first_wait_for_n_seconds is not None:
+            time.sleep(first_wait_for_n_seconds)
+
+        base_payoff_table, _ = self._manager_interface.get_latest_payoff_table(infinite_retry_on_error=False)
+
+        if base_payoff_table is None:
+            base_payoff_table = PayoffTable()
+        base_payoff_table: PayoffTable = base_payoff_table
+        active_policy_numbers, finished_policy_numbers, total_policy_numbers = self._get_active_and_finished_policy_numbers()
+        assert len(active_policy_numbers) + len(finished_policy_numbers) + 1 == total_policy_numbers + 1
+        are_all_lower_policies_finished = len(active_policy_numbers) == 0
+
+        # print(colored(f"Policy {self._claimed_policy_num}: Latest live stats for policies below this learner: "
+        #               f"{len(finished_policy_numbers)} policies finished, {len(active_policy_numbers)} active.", "magenta"))
+
+        if total_policy_numbers+1 == 0:
+            return None
+
+        # Payoff tables smaller than 2x2 are not interesting for diversity computation
+        if base_payoff_table.size() < 3:
+            return None
+
+        assert base_payoff_table.size() <= len(finished_policy_numbers) or base_payoff_table.size() == 1
+        missing_policy_nums = list(range(base_payoff_table.size(), total_policy_numbers+1))
+        for missing_policy_num in missing_policy_nums:
+            if missing_policy_num < missing_policy_nums[-1]:
+                missing_key = self._get_latest_key_for_policy_number(policy_num=missing_policy_num)
+            else:
+                missing_key = new_weight_key
+                # print(colored(f" My key: {missing_key} ", "magenta"))
+
+            if missing_key is None:
+                time.sleep(5)
+                missing_key = self._get_latest_key_for_policy_number(policy_num=missing_policy_num)
+
+            if missing_key is not None:
+                base_payoff_table.add_policy(new_policy_key=missing_key,
+                                             new_policy_class_name=self._policy_class_name,
+                                             new_policy_config_file_key=self._policy_config_key,
+                                             new_policy_tags=['locally_tracked'])
+
+        required_evals_observed = set()
+        required_evals_finalized = set()
+        while True:
+            matchup_order = base_payoff_table.get_eval_matchup_order()
+
+            if matchup_order is None:
+                break
+            if matchup_order not in required_evals_finalized:
+                as_policy_key, against_policy_key = matchup_order
+                payoff, games_played = self._check_eval_cache(as_policy_key=as_policy_key, against_policy_key=against_policy_key)
+                if payoff is None:
+
+                    payoff, games_played = self._manager_interface.request_eval_result(
+                        as_policy_key=as_policy_key,
+                        as_policy_config_key=self._policy_config_key,
+                        as_policy_class_name=self._policy_class_name,
+                        against_policy_key=against_policy_key,
+                        against_policy_config_key=self._policy_config_key,
+                        against_policy_class_name=self._policy_class_name,
+                        perform_eval_if_not_cached=matchup_order not in required_evals_observed,
+                        infinite_retry_on_error=False)
+
+                    if payoff is not None and matchup_order not in required_evals_observed:
+                        print(f"{colored(f'Policy {self._claimed_policy_num}: !!!! GOT A CACHE HIT FROM THE MANAGER !!!!','yellow')}\n"
+                              f"{colored(f'for {as_policy_key} vs {against_policy_key}', 'yellow')}")
+
+                    if payoff is None and matchup_order in required_evals_observed:
+                        print(colored(f"Policy {self._claimed_policy_num}: Waiting to get eval result for {as_policy_key} vs {against_policy_key}", "yellow"))
+                        time.sleep(2)
+
+                if payoff is not None:
+                    self._add_to_eval_cache_if_not_already_entered(as_policy_key=as_policy_key, against_policy_key=against_policy_key,
+                                                                   payoff=payoff, games_played=games_played)
+                    base_payoff_table.add_eval_result(as_policy_key=as_policy_key,
+                                                      against_policy_key=against_policy_key,
+                                                      payoff=payoff,
+                                                      games_played=games_played)
+                    required_evals_finalized.add(matchup_order)
+
+                required_evals_observed.add(matchup_order)
+
+        assert len(required_evals_observed) >= len(required_evals_finalized)
+        assert base_payoff_table.get_num_pending_policies() == 0, f"amount is {base_payoff_table.get_num_pending_policies()}"
+        assert base_payoff_table.size() == total_policy_numbers+1, f"base_payoff_table.size() is {base_payoff_table.size()}, total_policy_numbers+1={total_policy_numbers+1}"
+        return base_payoff_table.get_payoff_matrix()
+
+    ####################################################################################################################
+
+
     @ray.method(num_return_vals=1)
     def are_all_lower_policies_finished(self):
-        active_policy_numbers, finished_policy_numbers, total_policy_numbers = self.get_active_and_finished_policy_numbers()
+        active_policy_numbers, finished_policy_numbers, total_policy_numbers = self._get_active_and_finished_policy_numbers()
         assert len(active_policy_numbers) + len(finished_policy_numbers) == total_policy_numbers
         return len(active_policy_numbers) == 0
 
@@ -205,7 +297,7 @@ class LivePolicyPayoffTracker(object):
     def get_claimed_policy_num(self):
         return self._claimed_policy_num
 
-    def get_active_and_finished_policy_numbers(self):
+    def _get_active_and_finished_policy_numbers(self):
         start_time = time.time()
         while True:
             policy_status_locks = self._lock_interface.get_all_items(filter_by_string="policy_status: ")
@@ -250,7 +342,7 @@ class LivePolicyPayoffTracker(object):
         if self._claimed_policy_num is not None:
             raise ValueError(f"This interface has already claimed policy {self._claimed_policy_num}")
 
-        _, _, total_policy_numbers = self.get_active_and_finished_policy_numbers()
+        _, _, total_policy_numbers = self._get_active_and_finished_policy_numbers()
 
         claimed_policy_key = self._lock_interface.try_to_reserve_item_from_list(
             possible_item_names_in_order_of_highest_priority_first=[f"policy_status: {i} active" for i in range(total_policy_numbers, total_policy_numbers+100)])

@@ -7,6 +7,8 @@ import logging
 import os
 import shutil
 import time
+from dill import load, dump
+import copy
 
 import dill
 import numpy as np
@@ -50,6 +52,12 @@ tf = try_import_tf()
 TRAIN_POLICY = "train_policy"
 STATIC_POLICY = "static_policy"
 
+EVO_UPDATE_FREQ = 10  # [10, 100, 1000]
+EVO_WKS = 10  # [10, 100, 1000]
+EVO_SIGMA = 0.05  # [0.01, 0.1, 0.5]
+EVO_LR = 0.05  # [0.01, 0.5, 0.5]
+
+
 OBSERVATION_MODE = PARTIALLY_OBSERVABLE
 
 TRAINER_CLASS = SACTrainer
@@ -68,11 +76,11 @@ LOCK_SERVER_HOST = os.getenv("LOCK_SERVER_HOST", 'localhost')
 
 MANAGER_SERVER_HOST = os.getenv("MANAGER_SERVER_HOST", "localhost")
 
-MANAGER_PORT = int(os.getenv("MANAGER_PORT"))
+MANAGER_PORT = int(os.getenv("MANAGER_PORT", 27003))
 if not MANAGER_PORT:
     raise ValueError("Environment variable MANAGER_PORT needs to be set.")
 
-LOCK_SERVER_PORT = os.getenv("LOCK_SERVER_PORT")
+LOCK_SERVER_PORT = os.getenv("LOCK_SERVER_PORT", 27503)
 if not LOCK_SERVER_PORT:
     raise ValueError("Environment variable LOCK_SERVER_PORT needs to be set.")
 
@@ -100,6 +108,8 @@ if __name__ == "__main__":
         logger.info("\n\n\n\n\n__________________________________________\n"
                     f"LAUNCHED FOR {POKER_GAME_VERSION}\n"
                     f"__________________________________________\n\n\n\n\n")
+        print(f"{colored(f'############ HEREEEEEE1 #############', 'magenta')}\n")
+        time.sleep(1)
 
 
         storage_client = connect_storage_client()
@@ -160,6 +170,7 @@ if __name__ == "__main__":
                 init_train_policy_weights_from_static_policy_distribution_after_trainer_init_callback(trainer=trainer)
             else:
                 print(colored(f"Policy {trainer.claimed_policy_num}: (Initializing train policy to random)", "white"))
+            trainer.my_weights_updates = 0.
 
 
         def init_train_policy_weights_from_static_policy_distribution_after_trainer_init_callback(trainer):
@@ -190,6 +201,8 @@ if __name__ == "__main__":
 
             print(colored(f"Policy {trainer.claimed_policy_num}: Initializing train policy to {selected_policy_spec.key}", "white"))
 
+
+            # TODO: Here
             def worker_set_train_policy_weights(worker):
                 train_policy = worker.policy_map[TRAIN_POLICY]
                 train_policy.load_model_weights(load_file_path=weights_local_path,
@@ -298,6 +311,7 @@ if __name__ == "__main__":
             trainer = params['trainer']
             result = params['result']
             result['psro_policy_num'] = trainer.claimed_policy_num
+            evo_update(params)
 
             if not hasattr(trainer, 'next_refresh_steps'):
                 trainer.next_refresh_steps = CHECKPOINT_AND_REFRESH_LIVE_TABLE_EVERY_N_STEPS
@@ -497,6 +511,118 @@ if __name__ == "__main__":
             else:
                 raise ValueError(f"train_policy_mapping_fn: wasn't expecting an agent id of {agent_id}")
 
+        def copy_with_noise(weights_dict):
+            weights_wnoise_dict = {}
+            noise_dict = {}
+            for var_name, w in weights_dict.items():
+                if var_name.startswith("pi"):  # Ensure only modify policy, not value
+                    noise_dict[var_name] = np.random.randn(*w.shape)
+                    weights_wnoise_dict[var_name] = w.copy() + EVO_SIGMA*noise_dict[var_name]
+                else:
+                    weights_wnoise_dict[var_name] = w.copy()
+            return weights_wnoise_dict, noise_dict
+
+        def update_weights_to_fitness(weights_dict, evo_noise, evo_fitness_scores):
+            weights_fitness_dict = copy.deepcopy(weights_dict)
+            for e_j, f_j in zip(evo_noise, evo_fitness_scores):
+                for var_name, var in weights_dict.items():
+                    if var_name.startswith("pi"):  # Ensure only modify policy, not value
+                        weights_fitness_dict[var_name] += f_j*(EVO_LR / (EVO_WKS*EVO_SIGMA))*e_j[var_name]
+            return weights_fitness_dict
+
+        def save_weights(trainer, weights_dict, dir_name, name, iter_num):
+            # experiment_save_dir = /home/ubuntu/ray_results/leduc_poker_pipe_1_workers_learner_leduc_poker_sac_arch1_pipeline_psro_Area-51-16_pid_27214_04.08.09PM_Nov-25-2020
+            checkpoints_dir = os.path.join(experiment_save_dir, dir_name)  # New dir for this
+            checkpoint_name = f"policy_{trainer.claimed_policy_num}_{datetime_str()}_{name}_{iter_num}.dill"
+            checkpoint_save_path = os.path.join(checkpoints_dir, checkpoint_name)
+            ensure_dir(checkpoint_save_path)
+            with open(checkpoint_save_path, "wb") as dill_file:
+                dump(obj=weights_dict, file=dill_file)
+            return checkpoint_save_path
+
+        def fitness_score(payoff_array):
+            n = payoff_array.shape[0]
+            norm = np.linalg.norm(payoff_array, axis=1)
+            payoff_array = payoff_array / norm[:, np.newaxis]
+            L = payoff_array@payoff_array.T
+            L_card = np.trace(np.eye(n)-np.linalg.inv(L+np.eye(n)))
+            return L_card
+
+
+        def evo_update(params):
+            print(f"{colored(f'#####################################', 'magenta')}\n")
+            print(f"{colored(f'############ EVO UPDATE #############', 'magenta')}\n")
+            print(f"{colored(f'#####################################', 'magenta')}\n")
+            time.sleep(3600)
+            trainer = params['trainer']
+            result = params['result']
+
+            if trainer.my_weights_updates is None:
+                trainer.my_weights_updates = 0
+
+            if not trainer.my_weights_updates%EVO_UPDATE_FREQ==0:
+                trainer.my_weights_updates += 1
+                return
+            trainer.my_weights_updates += 1
+
+            # Add noise to weights
+            time.sleep(1)
+            local_train_policy = trainer.workers.local_worker().policy_map[TRAIN_POLICY]
+            weights_dict = local_train_policy.get_model_weights(remove_scope_prefix=TRAIN_POLICY)
+            evo_weights, evo_noise, evo_fitness_scores = [], [], []
+            for j in range(EVO_WKS):
+                # Get weights with noise
+                weights_wnoise_dict, noise_dict = copy_with_noise(weights_dict)
+                evo_weights.append(weights_wnoise_dict)
+                evo_noise.append(noise_dict)
+
+                checkpoint_save_path = save_weights(trainer, weights_wnoise_dict, "EVO_policy_checkpoints", "evowks", j)
+                my_key = checkpoint_save_path
+
+                # print(f"{colored(f'############ {my_key} #############', 'magenta')}\n")
+
+                # Get payoff table for given EVO_WKS
+                new_payoff_table_EVO_array = \
+                    ray_get_and_free(trainer.live_table_tracker.my_get_live_payoff_table_dill_pickled\
+                        .remote(new_weight_key=my_key, first_wait_for_n_seconds=0.1))
+
+                # Compute fitness score
+                if new_payoff_table_EVO_array is None:
+                    print(f"{colored(f'############ No payoff table #############', 'magenta')}\n")
+                    return
+
+                # print(new_payoff_table_EVO_array.shape)
+                evo_fitness_scores.append(fitness_score(new_payoff_table_EVO_array))
+
+            # Update weights
+            print(colored(evo_fitness_scores, 'magenta'))
+            weights_fitness_dict = update_weights_to_fitness(weights_dict, evo_noise, evo_fitness_scores)
+
+            # Set weights and compute fitness
+            def worker_set_train_policy_weights2(worker):
+                train_policy = worker.policy_map[TRAIN_POLICY]
+                train_policy.set_model_weights(weights=weights_fitness_dict,
+                                               add_scope_prefix=TRAIN_POLICY)
+            trainer.workers.foreach_worker(worker_set_train_policy_weights2)
+
+            _do_live_policy_checkpoint(trainer, result['training_iteration']+1)
+
+            # Save Checkpoint fit weights
+            checkpoint_save_path = save_weights(trainer, weights_fitness_dict,
+                                                "EVO_FINAL_policy_checkpoints", "iter", result['training_iteration']+1)
+            my_key = checkpoint_save_path
+
+            new_payoff_table_EVO = \
+                ray_get_and_free(trainer.live_table_tracker.my_get_live_payoff_table_dill_pickled \
+                                 .remote(new_weight_key=my_key, first_wait_for_n_seconds=0.1))
+
+            # Compute fitness
+            final_fitness = fitness_score(new_payoff_table_EVO)  # TODO: save this somewhere
+            print('Final fitness and stats')
+            # print(f"{colored(f'############ CHECK ! #############', 'magenta')}\n")
+            # time.sleep(3600)
+            return
+
 
         temp_env = ENV_CLASS(POKER_ENV_CONFIG)
         obs_space = temp_env.observation_space
@@ -518,7 +644,11 @@ if __name__ == "__main__":
 
             "callbacks_after_trainer_init": [
                 claim_new_active_policy_after_trainer_init_callback,
+                # evo_update,
             ],
+            # "callbacks_after_optim_step": [
+            #     evo_update,
+            # ],
             "callbacks": {
                 "on_train_result": all_on_train_result_callbacks,
                 'on_episode_start': sample_new_static_policy_weights_for_each_worker_on_episode_start,

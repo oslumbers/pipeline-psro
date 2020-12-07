@@ -165,6 +165,9 @@ def after_optimizer_step(trainer, fetches):
     update_target_if_needed(trainer, fetches)
     perform_relevant_custom_evals(trainer=trainer, fetches=fetches)
 
+    # if any(trainer.config["callbacks_after_optim_step"]):
+    #     for callback in trainer.config["callbacks_after_optim_step"]:
+    #         callback(trainer)
 
 def collect_metrics(trainer, selected_workers=None):
     metrics = trainer.optimizer.collect_metrics(

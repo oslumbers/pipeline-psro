@@ -55,7 +55,7 @@ class PokerMultiAgentEnv(MultiAgentEnv):
 
         self.include_infoset_in_observation = env_config['include_infoset_in_observation']
 
-        self.openspiel_env = Environment(game_name=self.game_version, discount=1.0,
+        self.openspiel_env = Environment(self.game_version, discount=1.0,
                                          **open_spiel_env_config)
 
         self.action_space = Discrete(self.openspiel_env.action_spec()["num_actions"])
