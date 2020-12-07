@@ -1,4 +1,4 @@
-games_per_eval_matchup: 20000
+games_per_eval_matchup: 1000
 max_ping_interval_seconds_to_track_workers: 30
 grpc_port: 27003
 num_thread_workers: 3

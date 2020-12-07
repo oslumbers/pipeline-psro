@@ -52,7 +52,7 @@ tf = try_import_tf()
 TRAIN_POLICY = "train_policy"
 STATIC_POLICY = "static_policy"
 
-EVO_UPDATE_FREQ = 10  # [10, 100, 1000]
+EVO_UPDATE_FREQ = 100  # [10, 100, 1000]
 EVO_WKS = 10  # [10, 100, 1000]
 EVO_SIGMA = 0.05  # [0.01, 0.1, 0.5]
 EVO_LR = 0.05  # [0.01, 0.5, 0.5]
